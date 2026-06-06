@@ -1,0 +1,16 @@
+[Unit]
+Description=Cue LED Strip Service
+After=multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/unico/matching_hub
+Environment=CUE_LED_COUNT=40
+ExecStart=/usr/bin/python3 -u /home/unico/matching_hub/cue_led_service.py
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

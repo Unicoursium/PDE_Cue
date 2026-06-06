@@ -1,0 +1,7 @@
+firebase-admin
+google-cloud-firestore
+pyserial
+pygame
+gpiozero
+rpi_ws281x
+fonttools

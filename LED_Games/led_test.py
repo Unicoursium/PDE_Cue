@@ -1,30 +1,18 @@
+import sys
 import time
-import board
-import neopixel
+from pathlib import Path
 
-LED_COUNT = 10
-LED_PIN = board.D18
-BRIGHTNESS = 0.2
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "matching_hub"))
 
-pixels = neopixel.NeoPixel(
-    LED_PIN,
-    LED_COUNT,
-    brightness=BRIGHTNESS,
-    auto_write=False,
-    pixel_order=neopixel.GRB
-)
+from led_client import LedClient
 
-pixels.fill((255, 0, 0))
-pixels.show()
-time.sleep(1)
 
-pixels.fill((0, 255, 0))
-pixels.show()
-time.sleep(1)
+LED_COUNT = 40
+client = LedClient()
 
-pixels.fill((0, 0, 255))
-pixels.show()
-time.sleep(1)
+for color in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):
+    client.set_pixels({index: color for index in range(LED_COUNT)})
+    time.sleep(1)
 
-pixels.fill((0, 0, 0))
-pixels.show()
+client.clear()
+print("Cue LED service test completed.")
