@@ -1,28 +1,10 @@
-from rpi_ws281x import PixelStrip, Color
-import time
+import sys
+from pathlib import Path
 
-LED_COUNT = 120
-LED_PIN = 18
-LED_FREQ_HZ = 800000
-LED_DMA = 10
-LED_BRIGHTNESS = 50
-LED_INVERT = False
-LED_CHANNEL = 0
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "matching_hub"))
 
-strip = PixelStrip(
-    LED_COUNT,
-    LED_PIN,
-    LED_FREQ_HZ,
-    LED_DMA,
-    LED_INVERT,
-    LED_BRIGHTNESS,
-    LED_CHANNEL
-)
+from led_client import LedClient
 
-strip.begin()
 
-for i in range(LED_COUNT):
-    strip.setPixelColor(i, Color(0, 0, 0))
-
-strip.show()
-time.sleep(0.5)
+LedClient().clear()
+print("Cue LED strip cleared through cue-led.service.")

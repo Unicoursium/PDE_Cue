@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "177332688703",
+    "firebase_url": "https://pde-g18-test-default-rtdb.firebaseio.com",
+    "project_id": "pde-g18-test",
+    "storage_bucket": "pde-g18-test.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:177332688703:android:daa717187f7fe421f1e58a",
+        "android_client_info": {
+          "package_name": "com.company.cue"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCKA-BqI7pzCIQdX7xvdgKtf_w0g6XFsLo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
