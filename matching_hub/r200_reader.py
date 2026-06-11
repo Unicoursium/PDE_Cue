@@ -1,9 +1,12 @@
 import time
+import os
+from glob import glob
 
 import serial
+from serial.tools import list_ports
 
 
-PORT = "/dev/ttyUSB0"
+PORT = os.environ.get("CUE_R200_PORT")
 BAUD = 115200
 
 INIT_COMMANDS = [
@@ -16,6 +19,9 @@ POLL_COMMAND = bytes.fromhex("AA 00 22 00 00 22 DD")
 
 SET_SELECT_MODE_ALL_OPERATIONS = bytes.fromhex("AA 00 12 00 01 00 13 DD")
 SET_QUERY_SEL_SL = bytes.fromhex("AA 00 0E 00 02 1C 20 4C DD")
+SELECTED_TAG_LED_COMMAND = bytes.fromhex(
+    "AA 00 39 00 09 00 00 00 00 00 00 04 00 01 47 DD"
+)
 
 
 def hex_string(data):
@@ -69,6 +75,29 @@ def build_select_target_command(epc):
     ) + epc_bytes
 
     return build_frame(command=0x0C, payload=payload)
+
+
+def natural_port_key(port):
+    return (
+        port.replace("/dev/ttyUSB", "0:")
+        .replace("/dev/ttyACM", "1:")
+    )
+
+
+def candidate_ports():
+    if PORT:
+        return [PORT]
+
+    devices = []
+
+    for port in list_ports.comports():
+        if "ttyUSB" in port.device or "ttyACM" in port.device:
+            devices.append(port.device)
+
+    if not devices:
+        devices = glob("/dev/ttyUSB*") + glob("/dev/ttyACM*")
+
+    return sorted(set(devices), key=natural_port_key)
 
 
 def split_frames(data):
@@ -156,19 +185,70 @@ def parse_frame(frame):
 
 
 class R200Reader:
-    def __init__(self, port=PORT, baud=BAUD):
+    def __init__(self, port=None, baud=BAUD):
         self.port = port
         self.baud = baud
         self.ser = None
 
+    def probe_port(self, port):
+        try:
+            with serial.Serial(port, self.baud, timeout=0.05) as probe:
+                probe.reset_input_buffer()
+
+                for cmd in INIT_COMMANDS:
+                    probe.write(cmd)
+                    probe.flush()
+
+                    start = time.time()
+                    response = b""
+                    while time.time() - start < 0.15:
+                        waiting = probe.in_waiting
+                        if waiting:
+                            response += probe.read(waiting)
+                        time.sleep(0.005)
+
+                    if split_frames(response):
+                        return True
+
+        except serial.SerialException as error:
+            print(f"R200 probe skipped {port}: {error}")
+
+        return False
+
+    def detect_port(self):
+        ports = candidate_ports()
+
+        if not ports:
+            print("No USB serial ports found for R200.")
+            return None
+
+        print(f"Probing R200 candidates: {', '.join(ports)}")
+
+        for port in ports:
+            if self.probe_port(port):
+                print(f"R200 detected on {port}")
+                return port
+
+        print("No R200 response found on candidate ports.")
+        return None
+
     def connect(self):
         while True:
             try:
+                if self.port is None:
+                    self.port = self.detect_port()
+
+                    if self.port is None:
+                        time.sleep(2)
+                        continue
+
                 self.ser = serial.Serial(self.port, self.baud, timeout=0.05)
                 print(f"R200 connected on {self.port}")
                 return
             except serial.SerialException as error:
                 print(f"R200 not ready: {error}")
+                if PORT is None:
+                    self.port = None
                 time.sleep(2)
 
     def close(self):
@@ -234,6 +314,10 @@ class R200Reader:
             self.send_and_read(cmd, read_time=0.12, log=True)
             time.sleep(0.1)
 
+            print(f"Triggering selected tag LED: {epc}")
+            self.send_and_read(SELECTED_TAG_LED_COMMAND, read_time=0.12, log=True)
+            time.sleep(0.1)
+
         print("Applying Select before Inventory...")
         self.send_and_read(SET_SELECT_MODE_ALL_OPERATIONS, read_time=0.12, log=True)
         time.sleep(0.1)
@@ -243,3 +327,14 @@ class R200Reader:
         time.sleep(0.1)
 
         print("R200 Select Mode ready.")
+
+    def select_epc_and_trigger_led(self, epc):
+        normalized_epc = normalize_epc(epc)
+
+        print(f"Selecting EPC for LED: {normalized_epc}")
+        select_cmd = build_select_target_command(normalized_epc)
+        self.send_and_read(select_cmd, read_time=0.08, log=True)
+        time.sleep(0.04)
+
+        print(f"Triggering selected tag LED: {normalized_epc}")
+        self.send_and_read(SELECTED_TAG_LED_COMMAND, read_time=0.08, log=True)

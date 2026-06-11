@@ -1,5 +1,6 @@
 import math
 import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from cue_games import play_game
 from cue_screen_games import play_screen_game
 from led_client import LedClient
+from nfc_readers import DualPn532Readers, debounce_uid
 
 
 WIDTH = int(os.environ.get("CUE_KIOSK_WIDTH", "640"))
@@ -15,6 +17,7 @@ FPS = 30
 FULLSCREEN = os.environ.get("CUE_KIOSK_FULLSCREEN", "1") != "0"
 TRUE_FULLSCREEN = os.environ.get("CUE_KIOSK_TRUE_FULLSCREEN", "0") == "1"
 DISPLAY_INDEX = int(os.environ.get("CUE_KIOSK_DISPLAY_INDEX", "0"))
+NFC_ENABLED = os.environ.get("CUE_KIOSK_NFC_ENABLED", "0") == "1"
 
 LEFT_BUTTON_PIN = int(os.environ.get("CUE_LEFT_BUTTON_PIN", "23"))
 RIGHT_BUTTON_PIN = int(os.environ.get("CUE_RIGHT_BUTTON_PIN", "24"))
@@ -28,6 +31,14 @@ LED_BRIGHTNESS = int(os.environ.get("CUE_LED_BRIGHTNESS", "60"))
 
 ROOT = Path(__file__).resolve().parent
 ASSET_DIR = ROOT / "assets"
+SERVICE_ACCOUNT_PATH = Path(
+    os.environ.get("CUE_FIREBASE_SERVICE_ACCOUNT", ROOT / "serviceAccountKey.json")
+)
+RIGHT_PN532_CS = os.environ.get("CUE_RIGHT_PN532_CS", "D8")
+MATCHING_RESET_SOCKET = os.environ.get(
+    "CUE_MATCHING_RESET_SOCKET",
+    "/tmp/cue-matching-hub.sock",
+)
 
 BG_DARK = (34, 34, 34)
 BG_LIGHT = (222, 222, 222)
@@ -42,25 +53,90 @@ class Game:
     title: str
     image: str
     script: str
+    rules_image: str
 
 
 GAMES = [
-    Game("Tug of War", "game_tug_of_war.png", "tug_of_war"),
-    Game("Hot Potato", "game_hot_potato.png", "hot_potato"),
-    Game("Reaction Time", "game_reaction_time.png", "reaction_time"),
+    Game("Tug of War", "game_tug_of_war.png", "tug_of_war", "rules_tug_of_war.png"),
+    Game("Hot Potato", "game_hot_potato.png", "hot_potato", "rules_hot_potato.png"),
+    Game("Reaction Time", "game_reaction_time.png", "reaction_time", "rules_reaction_time.png"),
     Game(
         "5 Second Reaction",
         "game_five_second_reaction.png",
         "five_second_reaction",
+        "rules_five_second_reaction.png",
     ),
-    Game("Darts", "game_darts.png", "darts"),
-    Game("Truth or Dare", "game_truth_or_dare.png", "truth_or_dare"),
-    Game("Exit", "game_exit.png", "exit"),
+    Game("Darts", "game_darts.png", "darts", "rules_darts.png"),
+    Game("Truth or Dare", "game_truth_or_dare.png", "truth_or_dare", "rules_truth_or_dare.png"),
+    Game("Exit", "game_exit.png", "exit", "game_exit.png"),
 ]
 
 SCREEN_GAMES = {"five_second_reaction", "darts", "truth_or_dare"}
 
 IMAGE_CACHE = {}
+
+
+class FirebaseProfiles:
+    def __init__(self, service_account_path):
+        self.service_account_path = Path(service_account_path)
+        self.db = None
+
+    def initialise(self):
+        if self.db is not None:
+            return
+
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(str(self.service_account_path))
+            firebase_admin.initialize_app(cred)
+
+        self.db = firestore.client()
+        print("Firebase profile verifier ready.")
+
+    def delete_profile_records(self, nfc_uids):
+        self.initialise()
+
+        for nfc_uid in nfc_uids:
+            print(f"Clearing Firebase records for NFC UID: {nfc_uid}")
+            self.db.collection("profiles").document(nfc_uid).delete()
+            self.db.collection("wristbands").document(nfc_uid).delete()
+
+
+class NfcScanners:
+    def __init__(self):
+        self.available = False
+        self.readers = None
+        self.last_left = (None, 0.0)
+        self.last_right = (None, 0.0)
+
+        try:
+            self.readers = DualPn532Readers(spi_cs=RIGHT_PN532_CS)
+            self.readers.initialise()
+            self.available = True
+        except Exception as error:
+            print(f"PN532 readers unavailable: {error}")
+
+    def scan(self):
+        if not self.available:
+            return None, None
+
+        seen = self.readers.read_once(timeout=0.05)
+        left_uid = seen["left"]
+        right_uid = seen["right"]
+
+        self.last_left, left_new = debounce_uid(self.last_left, left_uid)
+        self.last_right, right_new = debounce_uid(self.last_right, right_uid)
+
+        return (
+            left_uid if left_new else None,
+            right_uid if right_new else None,
+        )
+
+    def reset(self):
+        self.last_left = (None, 0.0)
+        self.last_right = (None, 0.0)
 
 
 class LedStrip:
@@ -246,14 +322,19 @@ def draw_clock(surface):
     )
 
 
-def draw_waiting(surface, left_ready, right_ready):
+def draw_waiting(surface, left_ready, right_ready, message=None):
     draw_clock(surface)
-    label = "Waiting for players"
+    label = "Scan both wristbands"
     if left_ready and not right_ready:
-        label = "Player 1 ready"
+        label = "Left wristband scanned"
     elif right_ready and not left_ready:
-        label = "Player 2 ready"
+        label = "Right wristband scanned"
+    elif left_ready and right_ready:
+        label = "Checking match"
     draw_centered_text(surface, label, 28, SOFT_PINK, (WIDTH // 2, HEIGHT - 58))
+
+    if message:
+        draw_centered_text(surface, message, 20, SOFT_PINK, (WIDTH // 2, HEIGHT - 28))
 
 
 def draw_game_card(surface, game):
@@ -264,6 +345,23 @@ def draw_game_card(surface, game):
 
     surface.fill(BG_LIGHT)
     draw_centered_text(surface, game.title, 42, BLACK, (WIDTH // 2, HEIGHT // 2))
+
+
+def draw_rules_page(surface, game):
+    image = load_image(game.rules_image, (WIDTH, HEIGHT))
+    if image:
+        surface.blit(image, (0, 0))
+        return
+
+    surface.fill(BG_DARK)
+    draw_centered_text(surface, game.title, 38, WHITE, (WIDTH // 2, HEIGHT // 2 - 20))
+    draw_centered_text(
+        surface,
+        "Press both buttons to start",
+        24,
+        SOFT_PINK,
+        (WIDTH // 2, HEIGHT // 2 + 42),
+    )
 
 
 def blend(a, b, amount):
@@ -300,13 +398,53 @@ def release_hardware(buttons, strip):
     buttons.close()
 
 
+def wait_for_both_buttons(screen, buttons, game):
+    left_was_pressed = False
+    right_was_pressed = False
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise KeyboardInterrupt
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                raise KeyboardInterrupt
+
+        keys = pygame.key.get_pressed()
+        left_pressed, right_pressed = buttons.states(keys)
+
+        draw_rules_page(screen, game)
+        pygame.display.flip()
+
+        if (
+            left_pressed
+            and right_pressed
+            and not (left_was_pressed and right_was_pressed)
+        ):
+            while True:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        raise KeyboardInterrupt
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        raise KeyboardInterrupt
+
+                keys = pygame.key.get_pressed()
+                release_left, release_right = buttons.states(keys)
+                if not release_left and not release_right:
+                    return
+                time.sleep(0.01)
+
+        left_was_pressed = left_pressed
+        right_was_pressed = right_pressed
+        time.sleep(0.02)
+
+
 def launch_game(game, screen, buttons, strip):
     strip.clear()
-    screen.fill(BG_DARK)
-    draw_logo(screen, dark=False)
-    draw_centered_text(screen, f"Starting {game.title}", 34, WHITE, (WIDTH // 2, HEIGHT // 2))
+    draw_rules_page(screen, game)
     pygame.display.flip()
-    time.sleep(0.7)
+    wait_for_both_buttons(screen, buttons, game)
+    draw_rules_page(screen, game)
+    pygame.display.flip()
 
     try:
         if game.script in SCREEN_GAMES:
@@ -325,6 +463,18 @@ def launch_game(game, screen, buttons, strip):
             )
     finally:
         print("Game ended. Returning to Cue kiosk.")
+
+
+def reset_matching_hub():
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1.0)
+            connection.connect(MATCHING_RESET_SOCKET)
+            connection.sendall(b"RESET\n")
+            response = connection.recv(64).decode(errors="replace").strip()
+            print(f"Matching hub reset response: {response}")
+    except OSError as error:
+        print(f"Could not reset matching hub: {error}")
 
 
 def run():
@@ -360,14 +510,22 @@ def run():
 
     strip = LedStrip()
     buttons = Buttons()
+    nfc_scanners = NfcScanners() if NFC_ENABLED else None
+    firebase_profiles = FirebaseProfiles(SERVICE_ACCOUNT_PATH)
 
     state = "clock"
-    left_ready = False
-    right_ready = False
+    left_ready = True
+    right_ready = True
+    left_nfc_uid = None
+    right_nfc_uid = None
+    session_nfc_uids = []
+    kiosk_status = None
     selected_game = 0
     previous_left = False
     previous_right = False
     game_started = False
+
+    state = "menu"
 
     try:
         running = True
@@ -384,28 +542,64 @@ def run():
             left_pressed, right_pressed = buttons.states(keys)
             left_edge = left_pressed and not previous_left
             right_edge = right_pressed and not previous_right
+            if nfc_scanners is not None:
+                left_scan_uid, right_scan_uid = nfc_scanners.scan()
+            else:
+                left_scan_uid, right_scan_uid = None, None
 
             if state == "clock":
-                if left_edge:
+                if left_scan_uid:
                     left_ready = True
+                    left_nfc_uid = left_scan_uid
+                    kiosk_status = f"Left: {left_nfc_uid[-6:]}"
+                    print(f"LEFT NFC scanned: {left_nfc_uid}")
                     state = "waiting"
-                if right_edge:
+                if right_scan_uid:
                     right_ready = True
+                    right_nfc_uid = right_scan_uid
+                    kiosk_status = f"Right: {right_nfc_uid[-6:]}"
+                    print(f"RIGHT NFC scanned: {right_nfc_uid}")
                     state = "waiting"
-                draw_waiting(screen, left_ready, right_ready)
+                draw_waiting(screen, left_ready, right_ready, kiosk_status)
                 led_ready(strip, now, left_ready, right_ready)
 
             elif state == "waiting":
-                if left_edge:
+                if left_scan_uid:
                     left_ready = True
-                if right_edge:
+                    left_nfc_uid = left_scan_uid
+                    kiosk_status = f"Left: {left_nfc_uid[-6:]}"
+                    print(f"LEFT NFC scanned: {left_nfc_uid}")
+                if right_scan_uid:
                     right_ready = True
+                    right_nfc_uid = right_scan_uid
+                    kiosk_status = f"Right: {right_nfc_uid[-6:]}"
+                    print(f"RIGHT NFC scanned: {right_nfc_uid}")
 
-                draw_waiting(screen, left_ready, right_ready)
+                draw_waiting(screen, left_ready, right_ready, kiosk_status)
                 led_ready(strip, now, left_ready, right_ready)
 
                 if left_ready and right_ready:
-                    state = "menu"
+                    pygame.display.flip()
+
+                    if left_nfc_uid != right_nfc_uid:
+                        session_nfc_uids = [left_nfc_uid, right_nfc_uid]
+                        state = "menu"
+                    else:
+                        kiosk_status = "Scan two different wristbands"
+                        draw_waiting(screen, False, False, kiosk_status)
+                        pygame.display.flip()
+                        time.sleep(1.5)
+                        state = "clock"
+
+                    left_ready = False
+                    right_ready = False
+                    left_nfc_uid = None
+                    right_nfc_uid = None
+                    kiosk_status = None
+                    if nfc_scanners is not None:
+                        nfc_scanners.reset()
+                    selected_game = 0
+                    state = "clock"
 
             elif state == "menu":
                 if left_edge:
@@ -419,9 +613,16 @@ def run():
                     selected = GAMES[selected_game]
 
                     if selected.script == "exit":
-                        state = "clock"
-                        left_ready = False
-                        right_ready = False
+                        if session_nfc_uids:
+                            try:
+                                firebase_profiles.delete_profile_records(session_nfc_uids)
+                            except Exception as error:
+                                print(f"Could not clear Firebase profiles: {error}")
+                            reset_matching_hub()
+                            session_nfc_uids = []
+                        state = "menu"
+                        left_ready = True
+                        right_ready = True
                         selected_game = 0
                     else:
                         game_started = True

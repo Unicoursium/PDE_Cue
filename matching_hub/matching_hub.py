@@ -1,5 +1,10 @@
 import threading
 import time
+import shutil
+import subprocess
+import os
+import socket
+from pathlib import Path
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -9,10 +14,18 @@ from r200_reader import R200Reader, normalize_epc
 
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
 POLL_INTERVAL = 0.1
+BOLD_AUDIO_REPEAT_SECONDS = 4.0
+BOLD_AUDIO_REPEAT_COUNT = 3
+BOLD_TTS_AMPLITUDE = os.environ.get("CUE_BOLD_TTS_AMPLITUDE", "200")
+BOLD_AUDIO_DEVICE = os.environ.get("CUE_BOLD_AUDIO_DEVICE", "default")
+RESET_SOCKET_PATH = Path(
+    os.environ.get("CUE_MATCHING_RESET_SOCKET", "/tmp/cue-matching-hub.sock")
+)
 
 active_users_by_epc = {}
 entered_users_by_epc = {}
 matched_pair = None
+reset_requested = threading.Event()
 
 state_lock = threading.RLock()
 
@@ -56,6 +69,17 @@ def users_are_compatible(user_a, user_b):
     return a_wants_b and b_wants_a
 
 
+def normalized_personality(user):
+    raw = str(user.get("personality") or "").strip().upper()
+
+    if "BOLD" in raw:
+        return "BOLD"
+    if "SHY" in raw:
+        return "SHY"
+
+    return raw
+
+
 def find_first_match():
     users = list(entered_users_by_epc.values())
 
@@ -65,6 +89,43 @@ def find_first_match():
                 return user_a, user_b
 
     return None
+
+
+def clear_match_state():
+    global matched_pair
+
+    with state_lock:
+        entered_users_by_epc.clear()
+        matched_pair = None
+
+    reset_requested.clear()
+    print("Matching hub state reset. Returning to R200 scanning.")
+
+
+def request_match_reset():
+    reset_requested.set()
+    print("Matching hub reset requested.")
+
+
+def reset_socket_loop():
+    RESET_SOCKET_PATH.unlink(missing_ok=True)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(RESET_SOCKET_PATH))
+        os.chmod(RESET_SOCKET_PATH, 0o666)
+        server.listen(1)
+        print(f"Listening for reset commands on {RESET_SOCKET_PATH}")
+
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                command = connection.recv(64).decode(errors="replace").strip().upper()
+
+                if command == "RESET":
+                    request_match_reset()
+                    connection.sendall(b"OK\n")
+                else:
+                    connection.sendall(b"UNKNOWN\n")
 
 
 def on_profiles_snapshot(docs, changes, read_time):
@@ -171,63 +232,143 @@ def maybe_create_match():
         return matched_pair
 
 
-def r200_loop():
-    reader = R200Reader()
-    reader.connect()
-    reader.initialise()
+def speak_text(text):
+    if shutil.which("espeak-ng") and shutil.which("aplay"):
+        espeak = subprocess.Popen(
+            [
+                "espeak-ng",
+                "--stdout",
+                "-s",
+                "145",
+                "-a",
+                BOLD_TTS_AMPLITUDE,
+                text,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        aplay = subprocess.run(
+            ["aplay", "-D", BOLD_AUDIO_DEVICE, "-q"],
+            stdin=espeak.stdout,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
 
-    print("R200 scanning all tags...")
+        if espeak.stdout:
+            espeak.stdout.close()
 
-    while True:
-        try:
-            with state_lock:
-                pair = matched_pair
+        _, espeak_error = espeak.communicate()
 
-            if pair is not None:
-                break
+        if espeak.returncode != 0:
+            print(f"espeak-ng failed: {espeak_error.decode(errors='replace')}")
+        if aplay.returncode != 0:
+            print(f"aplay failed: {aplay.stderr}")
+        return
 
-            tags = reader.inventory_once()
+    if shutil.which("espeak-ng"):
+        result = subprocess.run(
+            ["espeak-ng", "-s", "145", "-a", BOLD_TTS_AMPLITUDE, text],
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"espeak-ng failed: {result.stderr}")
+        return
 
-            for tag in tags:
-                note_entered_range(tag)
+    if shutil.which("spd-say"):
+        subprocess.run(["spd-say", text], check=False)
+        return
 
-            pair = maybe_create_match()
+    print("No text-to-speech command found. Install espeak-ng.")
 
-            if pair is not None:
-                break
 
-            time.sleep(POLL_INTERVAL)
-
-        except Exception as error:
-            print(f"R200 scan loop error: {error}")
-            time.sleep(1)
-
-    user_a, user_b = pair
+def run_shy_match_alert(reader, user_a, user_b):
     selected_epcs = [
         user_a["rfidEpc"],
         user_b["rfidEpc"],
     ]
 
-    reader.select_epcs(selected_epcs)
-    print("Continuously inventorying matched selected tags for LED alert...")
+    reader.initialise()
+    print("SHY match: alternating matched tag LED alerts...")
 
-    while True:
+    while not reset_requested.is_set():
         try:
-            tags = reader.inventory_once()
-            seen_epcs = {
-                normalize_epc(tag["epc"])
-                for tag in tags
-            }
-
             for epc in selected_epcs:
-                if normalize_epc(epc) in seen_epcs:
-                    print(f"SELECTED TAG SEEN: {epc}")
-
-            time.sleep(POLL_INTERVAL)
+                if reset_requested.is_set():
+                    break
+                reader.select_epc_and_trigger_led(epc)
+                time.sleep(0.15)
 
         except Exception as error:
-            print(f"Selected tag loop error: {error}")
+            print(f"Selected tag LED loop error: {error}")
             time.sleep(1)
+
+
+def run_bold_match_alert(user_a, user_b):
+    name_a = user_a.get("name") or "left player"
+    name_b = user_b.get("name") or "right player"
+    message = f"{name_a} and {name_b}, you are matched, please come to the hub."
+
+    print("BOLD match: announcing names through speaker...")
+    print(f"Announcement: {message}")
+
+    for _ in range(BOLD_AUDIO_REPEAT_COUNT):
+        if reset_requested.is_set():
+            break
+        speak_text(message)
+        time.sleep(BOLD_AUDIO_REPEAT_SECONDS)
+
+    print("BOLD match announcement completed. Waiting for kiosk reset...")
+
+    while not reset_requested.is_set():
+        time.sleep(0.2)
+
+
+def run_match_alert(reader, user_a, user_b):
+    personality = normalized_personality(user_a)
+
+    if personality == "SHY":
+        run_shy_match_alert(reader, user_a, user_b)
+        return
+
+    if personality == "BOLD":
+        run_bold_match_alert(user_a, user_b)
+        return
+
+    print(f"Unknown personality '{personality}'. No match alert configured.")
+
+
+def r200_loop():
+    reader = R200Reader()
+    reader.connect()
+
+    while True:
+        clear_match_state()
+        reader.initialise()
+
+        print("R200 scanning all tags...")
+
+        pair = None
+        while pair is None:
+            try:
+                tags = reader.inventory_once()
+
+                for tag in tags:
+                    note_entered_range(tag)
+
+                pair = maybe_create_match()
+
+                if pair is None:
+                    time.sleep(POLL_INTERVAL)
+
+            except Exception as error:
+                print(f"R200 scan loop error: {error}")
+                time.sleep(1)
+
+        user_a, user_b = pair
+        run_match_alert(reader, user_a, user_b)
 
 
 def main():
@@ -236,6 +377,9 @@ def main():
     db = initialise_firestore()
     watch = start_firestore_listener(db)
     print("Listening for ACTIVE profiles...")
+
+    reset_thread = threading.Thread(target=reset_socket_loop, daemon=True)
+    reset_thread.start()
 
     r200_thread = threading.Thread(target=r200_loop, daemon=True)
     r200_thread.start()

@@ -9,6 +9,7 @@ from led_client import Color, PixelStrip
 
 LED_COUNT = 40
 HALF_LED_COUNT = LED_COUNT // 2
+TUG_STEP_SIZE = 2
 LEFT_BUTTON_PIN = 23
 RIGHT_BUTTON_PIN = 24
 
@@ -126,10 +127,10 @@ class TugOfWar:
                 right_edge = right_now and not right_was_pressed
 
                 if left_edge and not right_edge:
-                    position += 1
+                    position = min(LED_COUNT - 1, position + TUG_STEP_SIZE)
                     self.show_position(position)
                 elif right_edge and not left_edge:
-                    position -= 1
+                    position = max(0, position - TUG_STEP_SIZE)
                     self.show_position(position)
 
                 left_was_pressed = left_now
@@ -154,7 +155,7 @@ class TugOfWar:
 
 def play_hot_potato(hardware):
     hot_side = random.choice(("left", "right"))
-    game_time = 30.0
+    game_time = 8.0
 
     def show_progress(elapsed):
         progress = max(0.0, min(1.0, elapsed / game_time))
