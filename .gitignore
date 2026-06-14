@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local environment files
+.env
+*.env
+!*.env.example
+local.properties
+
+# Firebase/Admin credentials
+serviceAccountKey.json
+*serviceAccount*.json
+firebase-adminsdk-*.json
+
+# AI DJ local runtime state
+AI_DJ/processed_soundcloud_tracks.json
+AI_DJ/listener.*.log

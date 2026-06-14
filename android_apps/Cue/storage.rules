@@ -1,0 +1,13 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function testingWindowOpen() {
+      return request.time < timestamp.date(2026, 12, 31);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if testingWindowOpen();
+    }
+  }
+}

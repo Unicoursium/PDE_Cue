@@ -1,16 +1,26 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.google.services)
     alias(libs.plugins.kotlin.compose)
 }
 
+kotlin {
+    jvmToolchain(11)
+}
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+
 android {
     namespace = "com.example.cue"
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.company.cue"
@@ -20,6 +30,16 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField(
+            "String",
+            "SOUNDCLOUD_CLIENT_ID",
+            "\"${localProperties.getProperty("soundcloud.client.id", "")}\""
+        )
+        buildConfigField(
+            "String",
+            "SOUNDCLOUD_CLIENT_SECRET",
+            "\"${localProperties.getProperty("soundcloud.client.secret", "")}\""
+        )
     }
 
     buildTypes {
@@ -37,6 +57,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -51,6 +72,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.firebase.analytics)
     implementation(libs.firebase.firestore)
+    implementation(libs.firebase.storage)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

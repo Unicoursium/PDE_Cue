@@ -1,0 +1,13 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function testingWindowOpen() {
+      return request.time < timestamp.date(2026, 12, 31);
+    }
+
+    match /{document=**} {
+      allow read, write: if testingWindowOpen();
+    }
+  }
+}
