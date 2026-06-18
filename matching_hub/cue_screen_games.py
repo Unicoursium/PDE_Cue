@@ -4,12 +4,11 @@ import random
 
 import pygame
 
+from led_layout import LED_COUNT, score_leds, side_leds
 
 WIDTH = 640
 HEIGHT = 480
 TARGET_SECONDS = 5.0
-LED_COUNT = 40
-HALF_LED_COUNT = LED_COUNT // 2
 
 BG = (34, 34, 34)
 WHITE = (255, 255, 255)
@@ -29,6 +28,7 @@ DART_NUMBERS = [
 
 DART_CENTER = (420, 260)
 DART_RADIUS = 155
+DARTS_STARTING_SCORE = 151
 
 TRUTH_QUESTIONS = [
     "What is something you wish people understood about you?",
@@ -240,7 +240,7 @@ def run_player_turn(screen, side, button, keyboard_key, left_result, right_resul
         time.sleep(0.005)
 
 
-def play_five_second_reaction(screen, left_button, right_button, strip):
+def play_five_second_reaction_round(screen, left_button, right_button, strip):
     left_result = run_player_turn(
         screen,
         "left",
@@ -276,12 +276,12 @@ def play_five_second_reaction(screen, left_button, right_button, strip):
         winner_pixels = {index: WIN_COLOR for index in range(LED_COUNT)}
     elif left_error < right_error:
         headline = "LEFT PLAYER WINS"
-        winner_pixels = {index: LEFT_COLOR for index in range(HALF_LED_COUNT)}
+        winner_pixels = {index: LEFT_COLOR for index in side_leds("left")}
     else:
         headline = "RIGHT PLAYER WINS"
         winner_pixels = {
             index: RIGHT_COLOR
-            for index in range(HALF_LED_COUNT, LED_COUNT)
+            for index in side_leds("right")
         }
 
     strip.set_pixels(winner_pixels)
@@ -300,6 +300,59 @@ def play_five_second_reaction(screen, left_button, right_button, strip):
         time.sleep(0.02)
 
     strip.clear()
+
+    if headline == "LEFT PLAYER WINS":
+        return "left"
+    if headline == "RIGHT PLAYER WINS":
+        return "right"
+
+    return None
+
+
+def play_five_second_reaction(screen, left_button, right_button, strip, points_to_win=1):
+    left_score = 0
+    right_score = 0
+    round_number = 1
+    max_rounds = points_to_win * 2 - 1
+
+    print(f"5 Second Reaction: first to {points_to_win} point(s) wins.")
+
+    while left_score < points_to_win and right_score < points_to_win and round_number <= max_rounds:
+        winner = play_five_second_reaction_round(
+            screen,
+            left_button,
+            right_button,
+            strip,
+        )
+
+        if winner == "left":
+            left_score += 1
+            round_number += 1
+        elif winner == "right":
+            right_score += 1
+            round_number += 1
+        else:
+            print("5 Second Reaction tie, replaying round.")
+
+    final_headline = (
+        "LEFT PLAYER WINS"
+        if left_score > right_score
+        else "RIGHT PLAYER WINS"
+    )
+    result_started = time.monotonic()
+    while time.monotonic() - result_started < 2.0:
+        pump_events()
+        screen.fill(BG)
+        draw_text(screen, final_headline, 42, WIN_COLOR, (WIDTH // 2, HEIGHT // 2))
+        draw_text(
+            screen,
+            f"{left_score} - {right_score}",
+            56,
+            WHITE,
+            (WIDTH // 2, HEIGHT // 2 + 72),
+        )
+        pygame.display.flip()
+        time.sleep(0.02)
 
 
 def dart_score(x, y, center, radius):
@@ -462,20 +515,21 @@ def draw_darts_scene(
 
 
 def show_darts_score_leds(strip, scores):
-    left_count = math.ceil(scores["left"] / 301 * HALF_LED_COUNT)
-    right_count = math.ceil(scores["right"] / 301 * HALF_LED_COUNT)
+    side_count = len(side_leds("left"))
+    left_count = math.ceil(scores["left"] / DARTS_STARTING_SCORE * side_count)
+    right_count = math.ceil(scores["right"] / DARTS_STARTING_SCORE * side_count)
     pixels = {}
 
-    for index in range(left_count):
+    for index in score_leds("left", left_count):
         pixels[index] = LEFT_COLOR
-    for index in range(right_count):
-        pixels[HALF_LED_COUNT + index] = RIGHT_COLOR
+    for index in score_leds("right", right_count):
+        pixels[index] = RIGHT_COLOR
 
     strip.set_pixels(pixels)
 
 
 def play_darts(screen, left_button, right_button, strip):
-    scores = {"left": 301, "right": 301}
+    scores = {"left": DARTS_STARTING_SCORE, "right": DARTS_STARTING_SCORE}
     active_side = "left"
     board_center = DART_CENTER
     board_radius = DART_RADIUS
@@ -547,11 +601,7 @@ def play_darts(screen, left_button, right_button, strip):
     strip.set_pixels(
         {
             index: LEFT_COLOR if winner == "left" else RIGHT_COLOR
-            for index in (
-                range(HALF_LED_COUNT)
-                if winner == "left"
-                else range(HALF_LED_COUNT, LED_COUNT)
-            )
+            for index in side_leds(winner)
         }
     )
     result_started = time.monotonic()
@@ -665,11 +715,7 @@ def play_truth_or_dare(screen, left_button, right_button, strip):
 
         active_pixels = {
             index: LEFT_COLOR if active_side == "left" else RIGHT_COLOR
-            for index in (
-                range(HALF_LED_COUNT)
-                if active_side == "left"
-                else range(HALF_LED_COUNT, LED_COUNT)
-            )
+            for index in side_leds(active_side)
         }
         strip.set_pixels(active_pixels)
         draw_truth_or_dare(
@@ -686,9 +732,22 @@ def play_truth_or_dare(screen, left_button, right_button, strip):
         time.sleep(0.02)
 
 
-def play_screen_game(game_name, screen, left_button, right_button, strip):
+def play_screen_game(
+    game_name,
+    screen,
+    left_button,
+    right_button,
+    strip,
+    points_to_win=None,
+):
     if game_name == "five_second_reaction":
-        play_five_second_reaction(screen, left_button, right_button, strip)
+        play_five_second_reaction(
+            screen,
+            left_button,
+            right_button,
+            strip,
+            points_to_win=points_to_win or 1,
+        )
         return
     if game_name == "darts":
         play_darts(screen, left_button, right_button, strip)

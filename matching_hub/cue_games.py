@@ -4,11 +4,16 @@ import time
 
 from gpiozero import Button
 
+from led_layout import (
+    LED_COUNT,
+    TUG_OF_WAR_CENTER_POSITION,
+    TUG_OF_WAR_PATH,
+    score_leds,
+    side_leds,
+)
 from led_client import Color, PixelStrip
 
 
-LED_COUNT = 40
-HALF_LED_COUNT = LED_COUNT // 2
 TUG_STEP_SIZE = 2
 LEFT_BUTTON_PIN = 23
 RIGHT_BUTTON_PIN = 24
@@ -75,30 +80,33 @@ class GameHardware:
 
 
 class TugOfWar:
-    def __init__(self, left_button=None, right_button=None):
+    def __init__(self, left_button=None, right_button=None, points_to_win=3):
         self.hardware = GameHardware(
             left_button=left_button,
             right_button=right_button,
         )
+        self.points_to_win = points_to_win
 
     def show_position(self, position):
         pixels = {}
-        for index in range(LED_COUNT):
-            if index < position:
-                pixels[index] = LEFT_COLOR
-            elif index > position:
-                pixels[index] = RIGHT_COLOR
+        for path_position, led_index in enumerate(TUG_OF_WAR_PATH):
+            if path_position < position:
+                pixels[led_index] = LEFT_COLOR
+            elif path_position > position:
+                pixels[led_index] = RIGHT_COLOR
             else:
-                pixels[index] = WHITE
+                pixels[led_index] = WHITE
         self.hardware.set_pixels(pixels)
 
     def countdown(self):
         self.hardware.wait_for_release()
         for count in range(3, 0, -1):
             pixels = {}
-            start = (LED_COUNT - count) // 2
+            start = TUG_OF_WAR_CENTER_POSITION - count // 2
             for offset in range(count):
-                pixels[start + offset] = YELLOW
+                path_position = start + offset
+                if 0 <= path_position < len(TUG_OF_WAR_PATH):
+                    pixels[TUG_OF_WAR_PATH[path_position]] = YELLOW
             self.hardware.set_pixels(pixels)
             time.sleep(0.7)
         self.hardware.fill(GREEN)
@@ -110,24 +118,29 @@ class TugOfWar:
         right_score = 0
         round_number = 1
 
-        print("Tug of War: first to 3 points wins.")
+        max_rounds = self.points_to_win * 2 - 1
+        print(f"Tug of War: first to {self.points_to_win} point(s) wins.")
 
-        while left_score < 3 and right_score < 3 and round_number <= 5:
+        while (
+            left_score < self.points_to_win
+            and right_score < self.points_to_win
+            and round_number <= max_rounds
+        ):
             print(f"Round {round_number}: Left {left_score} - Right {right_score}")
             self.countdown()
-            position = LED_COUNT // 2
+            position = TUG_OF_WAR_CENTER_POSITION
             self.show_position(position)
             left_was_pressed = False
             right_was_pressed = False
 
-            while 0 < position < LED_COUNT - 1:
+            while 0 < position < len(TUG_OF_WAR_PATH) - 1:
                 left_now = self.hardware.left_button.is_pressed
                 right_now = self.hardware.right_button.is_pressed
                 left_edge = left_now and not left_was_pressed
                 right_edge = right_now and not right_was_pressed
 
                 if left_edge and not right_edge:
-                    position = min(LED_COUNT - 1, position + TUG_STEP_SIZE)
+                    position = min(len(TUG_OF_WAR_PATH) - 1, position + TUG_STEP_SIZE)
                     self.show_position(position)
                 elif right_edge and not left_edge:
                     position = max(0, position - TUG_STEP_SIZE)
@@ -137,7 +150,7 @@ class TugOfWar:
                 right_was_pressed = right_now
                 time.sleep(0.005)
 
-            if position >= LED_COUNT - 1:
+            if position >= len(TUG_OF_WAR_PATH) - 1:
                 left_score += 1
                 print("Left wins the round.")
                 self.hardware.flash(LEFT_COLOR, times=4)
@@ -153,29 +166,31 @@ class TugOfWar:
         self.hardware.flash(winner_color, times=8)
 
 
-def play_hot_potato(hardware):
+def play_hot_potato(hardware, game_time=8.0):
     hot_side = random.choice(("left", "right"))
-    game_time = 8.0
 
     def show_progress(elapsed):
         progress = max(0.0, min(1.0, elapsed / game_time))
-        off_per_side = int((HALF_LED_COUNT - 1) * progress)
+        left_visible = max(0, len(side_leds("left")) - int(len(side_leds("left")) * progress))
+        right_visible = max(0, len(side_leds("right")) - int(len(side_leds("right")) * progress))
         pixels = {}
         left_color = RED if hot_side == "left" else GREEN
         right_color = GREEN if hot_side == "left" else RED
 
-        for index in range(0, HALF_LED_COUNT - off_per_side):
+        for index in score_leds("left", left_visible):
             pixels[index] = left_color
-        for index in range(HALF_LED_COUNT + off_per_side, LED_COUNT):
+        for index in score_leds("right", right_visible):
             pixels[index] = right_color
         hardware.set_pixels(pixels)
 
     print(f"Hot Potato, starting side: {hot_side.upper()}")
     for count in range(3, 0, -1):
         pixels = {}
-        start = (LED_COUNT - count) // 2
+        start = TUG_OF_WAR_CENTER_POSITION - count // 2
         for offset in range(count):
-            pixels[start + offset] = YELLOW
+            path_position = start + offset
+            if 0 <= path_position < len(TUG_OF_WAR_PATH):
+                pixels[TUG_OF_WAR_PATH[path_position]] = YELLOW
         hardware.set_pixels(pixels)
         time.sleep(0.7)
 
@@ -203,16 +218,8 @@ def play_hot_potato(hardware):
         show_progress(elapsed)
         time.sleep(0.01)
 
-    losing_range = (
-        range(0, HALF_LED_COUNT)
-        if hot_side == "left"
-        else range(HALF_LED_COUNT, LED_COUNT)
-    )
-    winning_range = (
-        range(HALF_LED_COUNT, LED_COUNT)
-        if hot_side == "left"
-        else range(0, HALF_LED_COUNT)
-    )
+    losing_range = side_leds(hot_side)
+    winning_range = side_leds("right" if hot_side == "left" else "left")
     print(f"{hot_side.upper()} PLAYER LOSES.")
 
     for _ in range(6):
@@ -224,22 +231,23 @@ def play_hot_potato(hardware):
     time.sleep(1.2)
 
 
-def play_reaction_time(hardware):
+def play_reaction_time(hardware, points_to_win=3):
     left_score = 0
     right_score = 0
     round_number = 1
 
     def show_score():
         pixels = {}
-        for index in range(left_score):
+        for index in score_leds("left", left_score):
             pixels[index] = LEFT_COLOR
-        for index in range(right_score):
-            pixels[LED_COUNT - 1 - index] = RIGHT_COLOR
+        for index in score_leds("right", right_score):
+            pixels[index] = RIGHT_COLOR
         hardware.set_pixels(pixels)
         time.sleep(1.2)
 
-    print("Reaction Time: first to 3 points wins.")
-    while left_score < 3 and right_score < 3 and round_number <= 5:
+    max_rounds = points_to_win * 2 - 1
+    print(f"Reaction Time: first to {points_to_win} point(s) wins.")
+    while left_score < points_to_win and right_score < points_to_win and round_number <= max_rounds:
         print(f"Round {round_number}: Left {left_score} - Right {right_score}")
         hardware.flash(WHITE, times=2, delay=0.12)
         hardware.wait_for_release()
@@ -306,9 +314,19 @@ def play_reaction_time(hardware):
     hardware.flash(LEFT_COLOR if left_score > right_score else RIGHT_COLOR, times=8)
 
 
-def play_game(game_name, left_button=None, right_button=None):
+def play_game(
+    game_name,
+    left_button=None,
+    right_button=None,
+    points_to_win=None,
+    hot_potato_seconds=None,
+):
     if game_name == "tug_of_war":
-        game = TugOfWar(left_button=left_button, right_button=right_button)
+        game = TugOfWar(
+            left_button=left_button,
+            right_button=right_button,
+            points_to_win=points_to_win or 3,
+        )
         try:
             game.play()
         finally:
@@ -321,9 +339,9 @@ def play_game(game_name, left_button=None, right_button=None):
     )
     try:
         if game_name == "hot_potato":
-            play_hot_potato(hardware)
+            play_hot_potato(hardware, game_time=hot_potato_seconds or 8.0)
         else:
-            play_reaction_time(hardware)
+            play_reaction_time(hardware, points_to_win=points_to_win or 3)
     finally:
         hardware.close()
 

@@ -9,7 +9,7 @@ from rpi_ws281x import Color, PixelStrip
 
 SOCKET_PATH = os.environ.get("CUE_LED_SOCKET", "/run/cue-led.sock")
 LOCK_PATH = os.environ.get("CUE_LED_LOCK", "/run/cue-led.lock")
-LED_COUNT = int(os.environ.get("CUE_LED_COUNT", "40"))
+LED_COUNT = int(os.environ.get("CUE_LED_COUNT", "55"))
 LED_PIN = int(os.environ.get("CUE_LED_PIN", "18"))
 LED_BRIGHTNESS = int(os.environ.get("CUE_LED_BRIGHTNESS", "60"))
 

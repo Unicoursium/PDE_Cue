@@ -5,7 +5,7 @@ After=multi-user.target
 [Service]
 Type=simple
 WorkingDirectory=/home/unico/matching_hub
-Environment=CUE_LED_COUNT=40
+Environment=CUE_LED_COUNT=55
 ExecStart=/usr/bin/python3 -u /home/unico/matching_hub/cue_led_service.py
 Restart=always
 RestartSec=2

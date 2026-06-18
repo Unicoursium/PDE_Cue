@@ -12,7 +12,6 @@ DEFAULT_COLLECTIONS = [
     "matches",
 ]
 
-CONFIRM_TEXT = "DELETE_CUE_DATA"
 BATCH_SIZE = 250
 
 
@@ -89,16 +88,16 @@ def parse_args():
         help="Firestore collections to clear.",
     )
     parser.add_argument(
-        "--confirm",
-        default="",
-        help=f"Required to delete data. Use: {CONFIRM_TEXT}",
+        "--dry-run",
+        action="store_true",
+        help="Preview what would be deleted without deleting anything.",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    dry_run = args.confirm != CONFIRM_TEXT
+    dry_run = args.dry_run
     service_account_path = Path(args.service_account).expanduser()
 
     if not service_account_path.exists():
@@ -113,10 +112,9 @@ def main():
     if dry_run:
         print()
         print("DRY RUN ONLY. No Firebase data will be deleted.")
-        print(f"To delete data, rerun with: --confirm {CONFIRM_TEXT}")
     else:
         print()
-        print("CONFIRMED DELETE. Firestore data will be deleted.")
+        print("Deleting Firestore data now.")
 
     db = initialise_firestore(service_account_path)
     total = clear_collections(

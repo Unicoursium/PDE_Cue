@@ -1,0 +1,4 @@
+# Put one VirtualDJ/SoundCloud search query per line.
+# Example:
+# Glitchery Heavenly Key
+# 2hollis Poster Boy
