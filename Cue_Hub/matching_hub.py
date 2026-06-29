@@ -1,38 +1,34 @@
-from __future__ import annotations
-
-import os
 import threading
 import time
+import os
+import socket
 from pathlib import Path
-from typing import Any
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+from r200_reader import R200Reader, normalize_epc
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-SERVICE_ACCOUNT_PATH = Path(
-    os.environ.get("FIREBASE_SERVICE_ACCOUNT", SCRIPT_DIR / "serviceAccountKey.json")
-)
-PROFILE_READY_STATUSES = {
-    status.strip()
-    for status in os.environ.get(
-        "CUE_WINDOWS_MATCH_PROFILE_STATUSES",
-        "ONBOARDING_SUBMITTED,WRISTBAND_SCANNED",
-    ).split(",")
-    if status.strip()
-}
+
+SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
+POLL_INTERVAL = 0.1
+PROFILE_READY_STATUS = os.environ.get("CUE_PROFILE_READY_STATUS", "WRISTBAND_SCANNED")
 PROFILE_MATCHED_STATUS = os.environ.get("CUE_PROFILE_MATCHED_STATUS", "MATCHED")
+RESET_SOCKET_PATH = Path(
+    os.environ.get("CUE_MATCHING_RESET_SOCKET", "/tmp/cue-matching-hub.sock")
+)
 
-active_users_by_profile_id: dict[str, dict[str, Any]] = {}
-matched_profile_ids: set[str] = set()
+active_users_by_epc = {}
+entered_users_by_epc = {}
+matched_pair = None
+reset_requested = threading.Event()
+
 state_lock = threading.RLock()
 
 
 def initialise_firestore():
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(str(SERVICE_ACCOUNT_PATH))
-        firebase_admin.initialize_app(cred)
+    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+    firebase_admin.initialize_app(cred)
     return firestore.client()
 
 
@@ -200,17 +196,25 @@ def matched_preferences_are_compatible(user_a, user_b):
 
 
 def users_are_compatible(user_a, user_b):
-    return (
-        user_is_interested_in(user_a, user_b)
-        and user_is_interested_in(user_b, user_a)
-        and age_is_compatible(user_a, user_b)
+    a_wants_b = user_is_interested_in(user_a, user_b)
+    b_wants_a = user_is_interested_in(user_b, user_a)
+    ages_match = (
+        age_is_compatible(user_a, user_b)
         and age_is_compatible(user_b, user_a)
-        and cue_choices_are_compatible(user_a, user_b)
-        and matched_preferences_are_compatible(user_a, user_b)
+    )
+    cue_choices_match = cue_choices_are_compatible(user_a, user_b)
+    matched_preferences_match = matched_preferences_are_compatible(user_a, user_b)
+
+    return (
+        a_wants_b
+        and b_wants_a
+        and ages_match
+        and cue_choices_match
+        and matched_preferences_match
     )
 
 
-def build_active_user(document_id, data):
+def build_active_user(document_id, data, rfid_epc):
     gender = normalize_gender(data.get("gender") or data.get("identity"))
     orientation = normalize_orientation(data.get("orientation") or data.get("lookingFor"))
     age = parse_int(data.get("age"))
@@ -218,17 +222,15 @@ def build_active_user(document_id, data):
     cue_choice = normalize_cue_choice(data.get("cueChoice"))
     matched_preference = clean_matched_preference(data.get("matchedPreference"))
 
-    if not all(
-        [
-            gender,
-            orientation,
-            age,
-            match_min_age,
-            match_max_age,
-            cue_choice,
-            matched_preference,
-        ]
-    ):
+    if not all([
+        gender,
+        orientation,
+        age,
+        match_min_age,
+        match_max_age,
+        cue_choice,
+        matched_preference,
+    ]):
         return None
 
     if not is_known_matched_preference(matched_preference):
@@ -255,7 +257,7 @@ def build_active_user(document_id, data):
         "matchedPreference": matched_preference,
         "pronunciation": data.get("pronunciation"),
         "nfcUid": data.get("nfcUid"),
-        "rfidEpc": data.get("rfidEpc"),
+        "rfidEpc": rfid_epc,
         "soundCloudTrack": data.get("soundCloudTrack"),
     }
 
@@ -275,33 +277,9 @@ def match_user_payload(user):
         "matchedPreference": user["matchedPreference"],
         "pronunciation": user.get("pronunciation"),
         "nfcUid": user.get("nfcUid"),
-        "rfidEpc": user.get("rfidEpc"),
+        "rfidEpc": user["rfidEpc"],
         "soundCloudTrack": user.get("soundCloudTrack"),
     }
-
-
-def find_first_match():
-    users = list(active_users_by_profile_id.values())
-
-    for index, user_a in enumerate(users):
-        if user_a["documentId"] in matched_profile_ids:
-            continue
-
-        for user_b in users[index + 1:]:
-            if user_b["documentId"] in matched_profile_ids:
-                continue
-
-            print(
-                "CHECKING MATCH:",
-                f"{user_a['name']} + {user_b['name']}",
-                "/",
-                f"{user_a['matchedPreference']} + {user_b['matchedPreference']}",
-            )
-
-            if users_are_compatible(user_a, user_b):
-                return user_a, user_b
-
-    return None
 
 
 def persist_match(db, user_a, user_b):
@@ -312,12 +290,23 @@ def persist_match(db, user_a, user_b):
 
     match_payload = {
         "status": PROFILE_MATCHED_STATUS,
-        "source": "windows_matcher",
         "createdAt": matched_at,
-        "profileIds": [user_a["documentId"], user_b["documentId"]],
-        "rfidEpcs": [user_a.get("rfidEpc"), user_b.get("rfidEpc")],
-        "nfcUids": [user_a.get("nfcUid"), user_b.get("nfcUid")],
-        "users": [match_user_payload(user_a), match_user_payload(user_b)],
+        "profileIds": [
+            user_a["documentId"],
+            user_b["documentId"],
+        ],
+        "rfidEpcs": [
+            user_a["rfidEpc"],
+            user_b["rfidEpc"],
+        ],
+        "nfcUids": [
+            user_a.get("nfcUid"),
+            user_b.get("nfcUid"),
+        ],
+        "users": [
+            match_user_payload(user_a),
+            match_user_payload(user_b),
+        ],
         "cueChoice": user_a["cueChoice"]
         if user_a["cueChoice"] == user_b["cueChoice"]
         else "EITHER",
@@ -349,120 +338,261 @@ def persist_match(db, user_a, user_b):
         merge=True,
     )
     batch.commit()
+
+    print(f"Firebase match written: matches/{match_ref.id}")
     return match_ref.id
 
 
-def maybe_create_match(db):
+def find_first_match():
+    users = list(entered_users_by_epc.values())
+
+    for i, user_a in enumerate(users):
+        for user_b in users[i + 1 :]:
+            if users_are_compatible(user_a, user_b):
+                return user_a, user_b
+
+    return None
+
+
+def clear_match_state():
+    global matched_pair
+
     with state_lock:
-        pair = find_first_match()
-        if pair is None:
-            return
+        entered_users_by_epc.clear()
+        matched_pair = None
 
-        user_a, user_b = pair
-        matched_profile_ids.add(user_a["documentId"])
-        matched_profile_ids.add(user_b["documentId"])
-
-    print()
-    print("MATCH FOUND")
-    print(
-        f"{user_a['name']} ({user_a['gender']}, {user_a['orientation']}, {user_a['age']})"
-        " <-> "
-        f"{user_b['name']} ({user_b['gender']}, {user_b['orientation']}, {user_b['age']})"
-    )
-
-    try:
-        match_id = persist_match(db, user_a, user_b)
-        print(f"Match written to Firestore: matches/{match_id}")
-    except Exception as error:
-        print(f"Could not write match to Firebase: {error}")
-        with state_lock:
-            matched_profile_ids.discard(user_a["documentId"])
-            matched_profile_ids.discard(user_b["documentId"])
+    reset_requested.clear()
+    print("Matching hub state reset. Returning to R200 scanning.")
 
 
-def handle_profiles_snapshot(db, docs, changes, read_time):
+def request_match_reset():
+    reset_requested.set()
+    print("Matching hub reset requested.")
+
+
+def reset_socket_loop():
+    RESET_SOCKET_PATH.unlink(missing_ok=True)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(RESET_SOCKET_PATH))
+        os.chmod(RESET_SOCKET_PATH, 0o666)
+        server.listen(1)
+        print(f"Listening for reset commands on {RESET_SOCKET_PATH}")
+
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                command = connection.recv(64).decode(errors="replace").strip().upper()
+
+                if command == "RESET":
+                    request_match_reset()
+                    connection.sendall(b"OK\n")
+                else:
+                    connection.sendall(b"UNKNOWN\n")
+
+
+def on_profiles_snapshot(docs, changes, read_time):
     del docs, read_time
-
-    changed = False
 
     with state_lock:
         for change in changes:
             data = change.document.to_dict() or {}
-            document_id = change.document.id
+            rfid_epc = data.get("rfidEpc")
             status = data.get("status")
 
-            if change.type.name not in ("ADDED", "MODIFIED"):
-                active_users_by_profile_id.pop(document_id, None)
-                changed = True
+            if not rfid_epc:
                 continue
 
-            if status == PROFILE_MATCHED_STATUS:
-                active_users_by_profile_id.pop(document_id, None)
-                matched_profile_ids.add(document_id)
-                changed = True
-                continue
+            rfid_epc = normalize_epc(rfid_epc)
 
-            if status not in PROFILE_READY_STATUSES:
-                active_users_by_profile_id.pop(document_id, None)
-                changed = True
-                continue
+            if change.type.name in ("ADDED", "MODIFIED") and status == PROFILE_READY_STATUS:
+                user = build_active_user(
+                    document_id=change.document.id,
+                    data=data,
+                    rfid_epc=rfid_epc,
+                )
 
-            user = build_active_user(document_id, data)
+                if user is None:
+                    active_users_by_epc.pop(rfid_epc, None)
+                    print(
+                        "PROFILE SKIPPED, INCOMPLETE MATCHING FIELDS:",
+                        change.document.id,
+                        "/",
+                        rfid_epc,
+                    )
+                    continue
 
-            if user is None:
-                active_users_by_profile_id.pop(document_id, None)
-                print("PROFILE SKIPPED, INCOMPLETE MATCHING FIELDS:", document_id)
-                changed = True
-                continue
+                active_users_by_epc[rfid_epc] = user
 
-            active_users_by_profile_id[document_id] = user
-            changed = True
-            print(
-                "READY USER:",
-                user["name"],
-                "/",
-                user["gender"],
-                "/",
-                user["orientation"],
-                "/ age",
-                user["age"],
-                "/ wants",
-                f"{user['matchMinAge']}-{user['matchMaxAge']}",
-                "/ cue",
-                user["cueChoice"],
-                "/ matched",
-                user["matchedPreference"],
-            )
+                print(
+                    "READY USER:",
+                    user["name"],
+                    "/",
+                    rfid_epc,
+                    "/",
+                    user["gender"],
+                    "/",
+                    user["orientation"],
+                    "/ age",
+                    user["age"],
+                    "/ wants",
+                    f"{user['matchMinAge']}-{user['matchMaxAge']}",
+                    "/ cue",
+                    user["cueChoice"],
+                    "/ matched",
+                    user["matchedPreference"],
+                )
 
-        print(f"Ready Windows users: {len(active_users_by_profile_id)}")
+            else:
+                active_users_by_epc.pop(rfid_epc, None)
+                print(f"PROFILE REMOVED FROM READY CACHE: {rfid_epc}")
 
-    if changed:
-        maybe_create_match(db)
+        print(f"Ready cloud users: {len(active_users_by_epc)}")
 
 
-def start_profile_listener(db):
-    def on_profiles_snapshot(docs, changes, read_time):
-        handle_profiles_snapshot(db, docs, changes, read_time)
+def start_firestore_listener(db):
+    query = db.collection("profiles").where("status", "==", PROFILE_READY_STATUS)
+    return query.on_snapshot(on_profiles_snapshot)
 
-    return db.collection("profiles").on_snapshot(on_profiles_snapshot)
+
+def note_entered_range(tag):
+    epc = normalize_epc(tag["epc"])
+
+    with state_lock:
+        user = active_users_by_epc.get(epc)
+
+        if not user:
+            return None
+
+        if epc in entered_users_by_epc:
+            return None
+
+        entered_users_by_epc[epc] = {
+            **user,
+            "firstSeen": time.time(),
+            "firstRssi": tag.get("rssi"),
+        }
+
+        print(
+            f"ENTERED BAR RANGE: {user['name']} / "
+            f"{epc} / RSSI {tag.get('rssi')} dBm"
+        )
+
+        return entered_users_by_epc[epc]
+
+
+def maybe_create_match(db):
+    global matched_pair
+
+    with state_lock:
+        if matched_pair is not None:
+            return matched_pair
+
+        pair = find_first_match()
+
+        if pair is None:
+            return None
+
+        matched_pair = pair
+        user_a, user_b = matched_pair
+
+        print()
+        print("MATCH FOUND")
+        print(
+            f"{user_a['name']} ({user_a['gender']}, {user_a['orientation']}, "
+            f"{user_a['age']}) <-> "
+            f"{user_b['name']} ({user_b['gender']}, {user_b['orientation']}, "
+            f"{user_b['age']})"
+        )
+        print(f"EPC A: {user_a['rfidEpc']}")
+        print(f"EPC B: {user_b['rfidEpc']}")
+        print()
+
+        try:
+            match_id = persist_match(db, user_a, user_b)
+            user_a["matchId"] = match_id
+            user_b["matchId"] = match_id
+        except Exception as error:
+            print(f"Could not write match to Firebase: {error}")
+
+        return matched_pair
+
+
+def run_wristband_led_alert(reader, user_a, user_b):
+    selected_epcs = [
+        user_a["rfidEpc"],
+        user_b["rfidEpc"],
+    ]
+
+    reader.initialise()
+    print("Match alert: alternating matched wristband LED alerts...")
+
+    while not reset_requested.is_set():
+        try:
+            for epc in selected_epcs:
+                if reset_requested.is_set():
+                    break
+                reader.select_epc_and_trigger_led(epc)
+                time.sleep(0.15)
+
+        except Exception as error:
+            print(f"Selected tag LED loop error: {error}")
+            time.sleep(1)
+
+
+def run_match_alert(reader, user_a, user_b):
+    run_wristband_led_alert(reader, user_a, user_b)
+
+
+def r200_loop(db):
+    reader = R200Reader()
+    reader.connect()
+
+    while True:
+        clear_match_state()
+        reader.initialise()
+
+        print("R200 scanning all tags...")
+
+        pair = None
+        while pair is None:
+            try:
+                tags = reader.inventory_once()
+
+                for tag in tags:
+                    note_entered_range(tag)
+
+                pair = maybe_create_match(db)
+
+                if pair is None:
+                    time.sleep(POLL_INTERVAL)
+
+            except Exception as error:
+                print(f"R200 scan loop error: {error}")
+                time.sleep(1)
+
+        user_a, user_b = pair
+        run_match_alert(reader, user_a, user_b)
 
 
 def main():
-    print("Cue Windows Matcher")
-    print("=" * 24)
-    print(f"Service account: {SERVICE_ACCOUNT_PATH}")
-    print(f"Ready statuses: {sorted(PROFILE_READY_STATUSES)}")
-    print(f"Matched status: {PROFILE_MATCHED_STATUS}")
+    print("Cue matching hub starting...")
 
     db = initialise_firestore()
-    watch = start_profile_listener(db)
-    print("Listening for Android-created profiles. Press Ctrl+C to stop.")
+    watch = start_firestore_listener(db)
+    print(f"Listening for {PROFILE_READY_STATUS} profiles...")
+
+    reset_thread = threading.Thread(target=reset_socket_loop, daemon=True)
+    reset_thread.start()
+
+    r200_thread = threading.Thread(target=r200_loop, args=(db,), daemon=True)
+    r200_thread.start()
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping Windows matcher...")
+        print("Stopping...")
         watch.unsubscribe()
 
 
